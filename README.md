@@ -40,6 +40,8 @@ Python 3.10 or newer is recommended. A webcam is required for the live dashboard
 python main.py
 ```
 
+The app now opens a small Tkinter control panel first. Detection remains idle until you click **Start**. Click **Stop** to halt the camera feed and generate the end-of-session report.
+
 Use a different camera index if needed:
 
 ```bash
@@ -52,7 +54,46 @@ Optional trained model weights:
 python main.py --model path\to\weights.pt
 ```
 
-Press `q` or `Esc` in the dashboard window to exit.
+For automated runs or environments where the control panel is not needed:
+
+```bash
+python main.py --no-control
+```
+
+Press `q` or `Esc` in the dashboard window to stop the active session.
+
+## Temporal Attention Window And Session Reporting
+
+### Tech Stack
+
+- Python for orchestration, buffering, telemetry, and UI control.
+- OpenCV for webcam capture, frame rendering, dashboard drawing, and Haar fallback detection.
+- MediaPipe FaceMesh when available for face landmarks, iris location, blink cues, and gaze vector extraction.
+- PyTorch `MultiModalTransformer` backbone in `models/temporal_model.py`.
+- Transformer/CNN backbone details:
+  - Gaze and AU streams are projected into a 128-dimensional token space.
+  - `CrossAttentionFusion` performs bidirectional gaze-to-AU and AU-to-gaze fusion with reliability gating.
+  - `BlinkFeatureExtractor` is a 1D-CNN blink encoder.
+  - `TemporalTransformerEncoder` uses rotary positional embeddings over the temporal token sequence.
+- ONNX export is supported through `MultiModalTransformer.export_to_onnx(...)`; the exported graph can be compiled for TensorRT, ONNX Runtime, OpenVINO, or another accelerator backend.
+
+### Spatiotemporal Fusion Logic
+
+Each camera frame is converted into structured signals: a normalized 3D gaze vector, blink intensity, facial AU-like descriptors, and stream-validity flags. The model path uses these signals as temporal tokens for multimodal Transformer fusion, while the realtime interpretation layer also maintains a rolling 2-second PoR buffer.
+
+The 2-second buffer performs state inference every 2 seconds. Gaze vectors are normalized and smoothed with a trailing weighted moving average, which suppresses high-frequency head shake, micro-jitter, and single-frame eye noise. After smoothing, the system evaluates whether the point of regard is inside the target zone. A distraction is only emitted when the smoothed PoR remains outside that zone for more than 60% of the rolling 2-second window.
+
+This means brief shakes and saccades do not immediately flip the state. The temporal state is fused back into the dashboard interpretation so the UI can distinguish stable focus from sustained attention drift.
+
+### Operational Flow
+
+1. Launch `python main.py`.
+2. The Tkinter control panel appears and the detection pipeline stays idle.
+3. Click **Start** to open the camera feed, begin calibration, start threaded feature extraction, and activate telemetry.
+4. During the active session, GazeApp tracks `Total_Active_Time`, `Focused_Duration`, and `Distracted_Duration`.
+5. Every 2 seconds, the temporal buffer emits a stable state using the 60% outside-zone rule.
+6. Click **Stop**, or press `q`/`Esc` in the OpenCV dashboard, to halt the camera feed.
+7. GazeApp generates an end-of-session report with total session length, attention ratio (`Focused_Duration / Total_Active_Time`), and a timestamped distraction-spike log.
 
 ## Calibration
 

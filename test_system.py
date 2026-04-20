@@ -5,7 +5,7 @@ import numpy as np
 import torch
 
 from models.temporal_model import BlinkFeatureExtractor, MultiModalAttentionDetector, MultiModalTransformer
-from src.attention_score import AttentionScorer, compute_attention_score
+from src.attention_score import AttentionScorer, TemporalStateInference, compute_attention_score
 
 
 def test_attention_score():
@@ -27,6 +27,28 @@ def test_realtime_scorer():
     trend = scorer.get_trend(window=20)
     print(f"Realtime score: {score:.3f}, trend: {trend['trend']:.4f}")
     assert score > 0.5
+
+
+def test_temporal_state_inference_jitter_tolerance():
+    temporal = TemporalStateInference(window_seconds=2.0, inference_interval_seconds=2.0, target_radius=0.18)
+    timestamp = 1000.0
+    for idx in range(60):
+        jitter = 0.03 if idx % 2 == 0 else -0.03
+        temporal.update(timestamp + idx / 30.0, np.array([jitter, 0.0, 1.0], dtype=np.float32), valid=True)
+    result = temporal.update(timestamp + 2.05, np.array([0.02, 0.0, 1.0], dtype=np.float32), valid=True)
+    print(f"Temporal jitter state: {result['state']}, outside: {result['outside_ratio']:.2f}")
+    assert result["state"] == "Focused"
+
+
+def test_temporal_state_inference_distracted_threshold():
+    temporal = TemporalStateInference(window_seconds=2.0, inference_interval_seconds=2.0, target_radius=0.18)
+    timestamp = 2000.0
+    for idx in range(60):
+        gaze = np.array([0.35, 0.0, 1.0], dtype=np.float32) if idx < 42 else np.array([0.0, 0.0, 1.0], dtype=np.float32)
+        temporal.update(timestamp + idx / 30.0, gaze, valid=True)
+    result = temporal.update(timestamp + 2.05, np.array([0.35, 0.0, 1.0], dtype=np.float32), valid=True)
+    print(f"Temporal distracted state: {result['state']}, outside: {result['outside_ratio']:.2f}")
+    assert result["state"] == "Distracted"
 
 
 def test_blink_extractor():
@@ -57,6 +79,8 @@ if __name__ == "__main__":
     print("Running GazeApp smoke tests")
     test_attention_score()
     test_realtime_scorer()
+    test_temporal_state_inference_jitter_tolerance()
+    test_temporal_state_inference_distracted_threshold()
     test_blink_extractor()
     test_model_forward()
     print("All smoke tests passed")

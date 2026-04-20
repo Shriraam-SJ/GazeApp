@@ -1,5 +1,6 @@
 from collections import deque
-from typing import Deque, Dict, Iterable, Optional
+from dataclasses import dataclass
+from typing import Deque, Dict, Iterable, List, Optional
 
 import numpy as np
 
@@ -170,6 +171,125 @@ class AttentionScorer:
         self.score_history.clear()
         self.last_score = 0.0
         self.last_saccade = False
+
+
+@dataclass
+class TemporalGazeSample:
+    timestamp: float
+    gaze: np.ndarray
+    valid: bool
+
+
+class TemporalStateInference:
+    """Two-second PoR state inference with weighted smoothing and jitter tolerance."""
+
+    def __init__(
+        self,
+        window_seconds: float = 2.0,
+        inference_interval_seconds: float = 2.0,
+        outside_threshold: float = 0.60,
+        target_radius: float = 0.18,
+        max_history_seconds: float = 4.0,
+    ) -> None:
+        self.window_seconds = float(window_seconds)
+        self.inference_interval_seconds = float(inference_interval_seconds)
+        self.outside_threshold = float(outside_threshold)
+        self.target_radius = float(target_radius)
+        self.samples: Deque[TemporalGazeSample] = deque()
+        self.max_history_seconds = float(max_history_seconds)
+        self.last_inference_at: Optional[float] = None
+        self.last_result: Dict[str, float | str | bool] = self._empty_result("Collecting")
+
+    def update(self, timestamp: float, gaze: np.ndarray, valid: bool = True) -> Dict[str, float | str | bool]:
+        timestamp = float(timestamp)
+        self.samples.append(TemporalGazeSample(timestamp, np.asarray(gaze, dtype=np.float32), bool(valid)))
+        self._trim(timestamp, self.max_history_seconds)
+
+        if self.last_inference_at is None:
+            self.last_inference_at = timestamp
+            return self.last_result
+
+        if timestamp - self.last_inference_at < self.inference_interval_seconds:
+            return self.last_result
+
+        self.last_inference_at = timestamp
+        self.last_result = self.infer(timestamp)
+        return self.last_result
+
+    def infer(self, now: Optional[float] = None) -> Dict[str, float | str | bool]:
+        if now is None:
+            now = self.samples[-1].timestamp if self.samples else 0.0
+        window = self._window(float(now))
+        valid = [sample for sample in window if sample.valid and np.isfinite(sample.gaze).all()]
+        duration = self._duration(window)
+        if len(valid) < 3 or duration < self.window_seconds * 0.5:
+            return self._empty_result("Data Uncertain", duration)
+
+        gaze = normalize_vectors(_as_gaze_array(sample.gaze for sample in valid))
+        smoothed = weighted_moving_average(gaze)
+        por_radius = np.linalg.norm(smoothed[:, :2], axis=1)
+        outside_ratio = float(np.mean(por_radius > self.target_radius))
+        mean_radius = float(np.mean(por_radius))
+        state = "Distracted" if outside_ratio > self.outside_threshold else "Focused"
+        confidence = float(np.clip(abs(outside_ratio - self.outside_threshold) / max(self.outside_threshold, EPS), 0.35, 0.98))
+        return {
+            "state": state,
+            "outside_ratio": outside_ratio,
+            "mean_por_radius": mean_radius,
+            "window_duration": duration,
+            "sample_count": float(len(valid)),
+            "confidence": confidence,
+            "inferred": True,
+        }
+
+    def reset(self) -> None:
+        self.samples.clear()
+        self.last_inference_at = None
+        self.last_result = self._empty_result("Collecting")
+
+    def _trim(self, now: float, history_seconds: float) -> None:
+        cutoff = now - history_seconds
+        while self.samples and self.samples[0].timestamp < cutoff:
+            self.samples.popleft()
+
+    def _window(self, now: float) -> List[TemporalGazeSample]:
+        cutoff = now - self.window_seconds
+        return [sample for sample in self.samples if sample.timestamp >= cutoff]
+
+    @staticmethod
+    def _duration(samples: List[TemporalGazeSample]) -> float:
+        if len(samples) < 2:
+            return 0.0
+        return float(max(samples[-1].timestamp - samples[0].timestamp, 0.0))
+
+    @staticmethod
+    def _empty_result(state: str, duration: float = 0.0) -> Dict[str, float | str | bool]:
+        return {
+            "state": state,
+            "outside_ratio": 0.0,
+            "mean_por_radius": 0.0,
+            "window_duration": duration,
+            "sample_count": 0.0,
+            "confidence": 0.0,
+            "inferred": False,
+        }
+
+
+def weighted_moving_average(values: np.ndarray, span: int = 5) -> np.ndarray:
+    """Apply a short trailing weighted moving average to suppress high-frequency jitter."""
+
+    values = np.asarray(values, dtype=np.float32)
+    if values.size == 0:
+        return values
+    span = int(max(1, span))
+    smoothed = np.empty_like(values, dtype=np.float32)
+    for idx in range(len(values)):
+        start = max(0, idx - span + 1)
+        chunk = values[start : idx + 1]
+        weights = np.arange(1, len(chunk) + 1, dtype=np.float32)
+        weights /= weights.sum()
+        smoothed[idx] = np.sum(chunk * weights[:, None], axis=0)
+    return smoothed
 
 
 if __name__ == "__main__":

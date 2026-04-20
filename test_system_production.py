@@ -3,7 +3,7 @@
 
 import numpy as np
 
-from main import InferenceThread
+from main import InferenceThread, SessionTelemetry, format_session_report
 from models.temporal_model import TorchInferenceBackend
 
 
@@ -31,7 +31,23 @@ def test_interpreter_rules():
     assert focused["state"] == "Focused"
 
 
+def test_session_report():
+    session = SessionTelemetry()
+    session.started_at_wall = 100.0
+    session.update(100.0, {"state": "Focused", "inferred": True})
+    session.update(101.0, {"state": "Distracted", "inferred": True, "outside_ratio": 0.75, "mean_por_radius": 0.22})
+    session.update(102.0, {"state": "Focused", "inferred": True})
+    session.stopped_at_wall = 103.0
+    report = session.summary()
+    text = format_session_report(report)
+    print(text)
+    assert report["Focused_Duration"] == 1.0
+    assert report["Distracted_Duration"] == 1.0
+    assert report["distraction_spikes"]
+
+
 if __name__ == "__main__":
     test_backend_predict()
     test_interpreter_rules()
+    test_session_report()
     print("Production smoke tests passed")

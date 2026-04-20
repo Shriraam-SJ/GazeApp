@@ -7,8 +7,9 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
+from datetime import datetime
 from queue import Empty, Queue
-from typing import Any, Deque, Dict, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -20,7 +21,14 @@ except Exception:
     mp = None
 
 from models.temporal_model import CLASS_NAMES, SubjectBaselineCalibration, TorchInferenceBackend, UNCERTAIN_CLASS
-from src.attention_score import AttentionScorer
+from src.attention_score import AttentionScorer, TemporalStateInference
+
+try:
+    import tkinter as tk
+    from tkinter import messagebox
+except Exception:
+    tk = None
+    messagebox = None
 
 
 WINDOW_SIZE = 150
@@ -77,6 +85,83 @@ class Telemetry:
             "process_mb": float(self.process.memory_info().rss / (1024 * 1024)),
             "avg_sync_offset_ms": float(np.mean(self.sync_offsets_ms)) if self.sync_offsets_ms else 0.0,
         }
+
+
+class SessionTelemetry:
+    """Tracks active-session attention durations and temporal distraction spikes."""
+
+    def __init__(self) -> None:
+        self.started_at_wall = time.time()
+        self.started_at_perf = time.perf_counter()
+        self.stopped_at_wall: Optional[float] = None
+        self.last_timestamp: Optional[float] = None
+        self.last_state: Optional[str] = None
+        self.focused_duration = 0.0
+        self.distracted_duration = 0.0
+        self.distraction_spikes: List[Dict[str, Any]] = []
+
+    def update(self, timestamp: float, temporal_state: Dict[str, Any]) -> None:
+        state = str(temporal_state.get("state", "Data Uncertain"))
+        if self.last_timestamp is not None:
+            delta = max(0.0, min(float(timestamp) - self.last_timestamp, 1.0))
+            if self.last_state == "Focused":
+                self.focused_duration += delta
+            elif self.last_state == "Distracted":
+                self.distracted_duration += delta
+
+        if state == "Distracted" and self.last_state != "Distracted" and bool(temporal_state.get("inferred", False)):
+            self.distraction_spikes.append(
+                {
+                    "timestamp": datetime.fromtimestamp(float(timestamp)).isoformat(timespec="seconds"),
+                    "outside_ratio": float(temporal_state.get("outside_ratio", 0.0)),
+                    "mean_por_radius": float(temporal_state.get("mean_por_radius", 0.0)),
+                }
+            )
+
+        self.last_timestamp = float(timestamp)
+        self.last_state = state
+
+    def stop(self) -> Dict[str, Any]:
+        if self.stopped_at_wall is None:
+            self.stopped_at_wall = time.time()
+        return self.summary()
+
+    def summary(self) -> Dict[str, Any]:
+        ended = self.stopped_at_wall or time.time()
+        total = max(0.0, ended - self.started_at_wall)
+        attention_ratio = self.focused_duration / total if total > 0 else 0.0
+        return {
+            "Total_Active_Time": total,
+            "Focused_Duration": self.focused_duration,
+            "Distracted_Duration": self.distracted_duration,
+            "Attention_Ratio": attention_ratio,
+            "started_at": datetime.fromtimestamp(self.started_at_wall).isoformat(timespec="seconds"),
+            "stopped_at": datetime.fromtimestamp(ended).isoformat(timespec="seconds"),
+            "distraction_spikes": list(self.distraction_spikes),
+        }
+
+
+def format_session_report(report: Dict[str, Any]) -> str:
+    spikes = report.get("distraction_spikes", [])
+    lines = [
+        "GazeApp Session Report",
+        f"Started: {report['started_at']}",
+        f"Stopped: {report['stopped_at']}",
+        f"Total session length: {report['Total_Active_Time']:.1f}s",
+        f"Focused_Duration: {report['Focused_Duration']:.1f}s",
+        f"Distracted_Duration: {report['Distracted_Duration']:.1f}s",
+        f"Attention Ratio: {report['Attention_Ratio']:.2%}",
+        "Distraction spikes:",
+    ]
+    if spikes:
+        for spike in spikes:
+            lines.append(
+                f"- {spike['timestamp']} outside_ratio={spike['outside_ratio']:.2f} "
+                f"mean_por_radius={spike['mean_por_radius']:.3f}"
+            )
+    else:
+        lines.append("- None detected")
+    return "\n".join(lines)
 
 
 class FaceFeatureExtractor:
@@ -348,7 +433,9 @@ class InferenceThread(threading.Thread):
         self.backend = TorchInferenceBackend(model_path=model_path)
         self.calibration = SubjectBaselineCalibration(fps=30, duration_seconds=10)
         self.scorer = AttentionScorer(window_size=WINDOW_SIZE)
+        self.temporal_inference = TemporalStateInference(window_seconds=2.0, inference_interval_seconds=2.0)
         self.telemetry = Telemetry()
+        self.session = SessionTelemetry()
         self.gaze_buffer: Deque[np.ndarray] = deque(maxlen=WINDOW_SIZE)
         self.blink_buffer: Deque[np.ndarray] = deque(maxlen=WINDOW_SIZE)
         self.au_buffer: Deque[np.ndarray] = deque(maxlen=WINDOW_SIZE)
@@ -381,6 +468,7 @@ class InferenceThread(threading.Thread):
         self.au_valid_buffer.append(packet.au_valid)
 
         attention_score = self.scorer.update(gaze, valid=packet.gaze_valid)
+        temporal_state = self.temporal_inference.update(packet.timestamp, gaze, valid=packet.gaze_valid)
         model_result = {
             "state": UNCERTAIN_CLASS,
             "confidence": 0.0,
@@ -397,7 +485,8 @@ class InferenceThread(threading.Thread):
                 np.asarray(self.au_valid_buffer, dtype=bool),
             )
 
-        interpreted = self.interpret(attention_score, blink, packet.face_detected, model_result)
+        interpreted = self.interpret(attention_score, blink, packet.face_detected, model_result, temporal_state)
+        self.session.update(packet.timestamp, temporal_state)
         inference_ms = (time.perf_counter() - started) * 1000.0
         self.telemetry.update(inference_ms, packet.stream_sync_offset_ms)
         health = self.telemetry.report()
@@ -418,6 +507,7 @@ class InferenceThread(threading.Thread):
             "face_detected": packet.face_detected,
             "attention_score": attention_score,
             "saccade": self.scorer.last_saccade,
+            "temporal_state": temporal_state,
             "state": interpreted["state"],
             "interpretation": interpreted["interpretation"],
             "confidence": interpreted["confidence"],
@@ -426,11 +516,32 @@ class InferenceThread(threading.Thread):
             "calibration_progress": self.calibration.progress,
             "calibrated": self.calibration.calibrated,
             "health": health,
+            "session": self.session.summary(),
         }
 
-    def interpret(self, score: float, blink: np.ndarray, face_detected: bool, model_result: Dict[str, Any]) -> Dict[str, Any]:
+    def interpret(
+        self,
+        score: float,
+        blink: np.ndarray,
+        face_detected: bool,
+        model_result: Dict[str, Any],
+        temporal_state: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         if not face_detected:
             return {"state": UNCERTAIN_CLASS, "confidence": 0.0, "interpretation": "Face lost. Improve lighting or camera angle."}
+        if temporal_state and bool(temporal_state.get("inferred", False)):
+            if temporal_state.get("state") == "Distracted":
+                return {
+                    "state": "Mind-Wandering",
+                    "confidence": float(temporal_state.get("confidence", 0.7)),
+                    "interpretation": "PoR remained outside the target zone for more than 60% of the 2-second window.",
+                }
+            if temporal_state.get("state") == "Focused" and score >= 0.45:
+                return {
+                    "state": "Focused",
+                    "confidence": max(float(temporal_state.get("confidence", 0.7)), min(0.95, 0.62 + score * 0.3)),
+                    "interpretation": "Smoothed gaze stayed inside the target zone across the temporal window.",
+                }
         blink_level = float(np.asarray(blink).reshape(-1)[0])
         if blink_level > 2.0 and score < 0.45:
             return {"state": "Drowsy", "confidence": 0.75, "interpretation": "Long eye closures and unstable gaze suggest fatigue."}
@@ -500,14 +611,18 @@ class Dashboard:
         self.bar(canvas, "Attention", result["attention_score"], (panel_x, 210), color)
         self.bar(canvas, "Calibration", result["calibration_progress"], (panel_x, 270), (120, 190, 255))
         gaze_w, au_w = result["fusion_weights"]
-        self.bar(canvas, "Gaze weight", float(gaze_w), (panel_x, 330), (120, 220, 170))
-        self.bar(canvas, "AU weight", float(au_w), (panel_x, 390), (170, 170, 240))
+        self.bar(canvas, "Gaze weight", float(gaze_w), (panel_x, 320), (120, 220, 170))
+        self.bar(canvas, "AU weight", float(au_w), (panel_x, 370), (170, 170, 240))
 
+        temporal = result["temporal_state"]
+        session = result["session"]
         health = result["health"]
-        y = 475
+        y = 440
         lines = [
             f"Face: {'yes' if result['face_detected'] else 'no'}",
             f"Saccadic suppression: {'on' if result['saccade'] else 'off'}",
+            f"2s state: {temporal['state']} outside {float(temporal['outside_ratio']):.2f}",
+            f"Active: {session['Total_Active_Time']:.1f}s ratio {session['Attention_Ratio']:.2f}",
             f"Inference: {health['avg_inference_ms']:.1f} ms avg",
             f"CPU: {health['cpu_percent']:.1f}%",
             f"FPS: {health['fps']:.1f}",
@@ -552,6 +667,8 @@ class AttentionMonitor:
         self.capture_thread = CameraCaptureThread(self.data_queue, self.stop_event, camera_index)
         self.inference_thread = InferenceThread(self.data_queue, self.result_queue, self.stop_event, model_path)
         self.dashboard = Dashboard(self.result_queue, self.stop_event)
+        self._stop_lock = threading.Lock()
+        self._stopped = False
 
     def start(self) -> None:
         logger.info("Starting GazeApp dashboard.")
@@ -559,11 +676,18 @@ class AttentionMonitor:
         self.inference_thread.start()
         self.dashboard.run()
 
-    def stop(self) -> None:
-        self.stop_event.set()
-        self.capture_thread.join(timeout=2)
-        self.inference_thread.join(timeout=2)
-        logger.info("GazeApp stopped.")
+    def stop(self) -> Dict[str, Any]:
+        with self._stop_lock:
+            self.stop_event.set()
+            self.capture_thread.join(timeout=2)
+            self.inference_thread.join(timeout=2)
+            if not self._stopped:
+                self._stopped = True
+                logger.info("GazeApp stopped.")
+            return self.inference_thread.session.stop()
+
+    def report(self) -> Dict[str, Any]:
+        return self.inference_thread.session.summary()
 
     def get_status(self) -> Dict[str, Any]:
         return {
@@ -577,20 +701,111 @@ class AttentionMonitor:
         }
 
 
+class ControlPanel:
+    """Small Tkinter manual control surface for starting and stopping sessions."""
+
+    def __init__(self, model_path: Optional[str] = None, camera_index: int = 0):
+        if tk is None:
+            raise RuntimeError("Tkinter is unavailable in this Python environment.")
+        self.model_path = model_path
+        self.camera_index = camera_index
+        self.root = tk.Tk()
+        self.root.title("GazeApp Controls")
+        self.root.geometry("420x230")
+        self.root.resizable(False, False)
+        self.monitor: Optional[AttentionMonitor] = None
+        self.monitor_thread: Optional[threading.Thread] = None
+        self.report_displayed = False
+        self.status_var = tk.StringVar(value="Idle. Press Start to begin detection.")
+        self.report_text = tk.StringVar(value="No session report yet.")
+
+        tk.Label(self.root, text="GazeApp Attention Session", font=("Segoe UI", 14, "bold")).pack(pady=(18, 6))
+        tk.Label(self.root, textvariable=self.status_var, font=("Segoe UI", 10)).pack(pady=4)
+        buttons = tk.Frame(self.root)
+        buttons.pack(pady=12)
+        self.start_button = tk.Button(buttons, text="Start", width=14, command=self.start_session)
+        self.start_button.pack(side=tk.LEFT, padx=8)
+        self.stop_button = tk.Button(buttons, text="Stop", width=14, state=tk.DISABLED, command=self.stop_session)
+        self.stop_button.pack(side=tk.LEFT, padx=8)
+        tk.Label(self.root, textvariable=self.report_text, justify=tk.LEFT, anchor="w", wraplength=380).pack(fill=tk.X, padx=20, pady=8)
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
+
+    def run(self) -> None:
+        self.root.mainloop()
+
+    def start_session(self) -> None:
+        if self.monitor_thread and self.monitor_thread.is_alive():
+            return
+        self.monitor = AttentionMonitor(model_path=self.model_path, camera_index=self.camera_index)
+        self.report_displayed = False
+        self.monitor_thread = threading.Thread(target=self._run_monitor, daemon=True)
+        self.monitor_thread.start()
+        self.status_var.set("Active. Camera feed and detection are running.")
+        self.report_text.set("Session in progress.")
+        self.start_button.configure(state=tk.DISABLED)
+        self.stop_button.configure(state=tk.NORMAL)
+
+    def stop_session(self) -> None:
+        if self.monitor is None:
+            return
+        report = self.monitor.stop()
+        self._show_report(report)
+
+    def close(self) -> None:
+        if self.monitor is not None:
+            self.monitor.stop()
+        self.root.destroy()
+
+    def _run_monitor(self) -> None:
+        assert self.monitor is not None
+        try:
+            self.monitor.start()
+        finally:
+            report = self.monitor.stop()
+            try:
+                self.root.after(0, lambda: self._show_report(report))
+            except Exception:
+                logger.info("\n%s", format_session_report(report))
+
+    def _show_report(self, report: Dict[str, Any]) -> None:
+        if self.report_displayed:
+            return
+        self.report_displayed = True
+        report_text = format_session_report(report)
+        logger.info("\n%s", report_text)
+        self.status_var.set("Stopped. Session report generated.")
+        self.report_text.set(
+            f"Total: {report['Total_Active_Time']:.1f}s | "
+            f"Focused: {report['Focused_Duration']:.1f}s | "
+            f"Distracted: {report['Distracted_Duration']:.1f}s | "
+            f"Ratio: {report['Attention_Ratio']:.2%}"
+        )
+        self.start_button.configure(state=tk.NORMAL)
+        self.stop_button.configure(state=tk.DISABLED)
+        if messagebox is not None:
+            messagebox.showinfo("End-of-Session Report", report_text)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Realtime GazeApp attention dashboard.")
     parser.add_argument("--camera", type=int, default=0, help="OpenCV camera index.")
     parser.add_argument("--model", type=str, default=None, help="Optional trained PyTorch state_dict path.")
+    parser.add_argument("--no-control", action="store_true", help="Start immediately without the Tkinter Start/Stop panel.")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if not args.no_control and tk is not None:
+        ControlPanel(model_path=args.model, camera_index=args.camera).run()
+        return
+
     monitor = AttentionMonitor(model_path=args.model, camera_index=args.camera)
     try:
         monitor.start()
     finally:
-        monitor.stop()
+        report = monitor.stop()
+        logger.info("\n%s", format_session_report(report))
 
 
 if __name__ == "__main__":
